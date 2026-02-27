@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::logical_plan::producer::{SubstraitProducer, to_substrait_literal_expr};
+use crate::logical_plan::producer::{
+    SubstraitProducer, to_substrait_literal_expr, to_substrait_type,
+};
 use datafusion::common::{DFSchemaRef, ScalarValue, not_impl_err};
-use datafusion::logical_expr::{Between, BinaryExpr, Expr, Like, Operator, expr};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Expr, ExprSchemable, Like, Operator, expr,
+};
 use substrait::proto::expression::{RexType, ScalarFunction};
 use substrait::proto::function_argument::ArgType;
-use substrait::proto::{Expression, FunctionArgument};
+use substrait::proto::{Expression, FunctionArgument, Type};
 
 pub fn from_scalar_function(
     producer: &mut impl SubstraitProducer,
@@ -97,7 +101,19 @@ pub fn from_binary_expr(
     let BinaryExpr { left, op, right } = expr;
     let l = producer.handle_expr(left, schema)?;
     let r = producer.handle_expr(right, schema)?;
-    Ok(make_binary_op_scalar_func(producer, &l, &r, *op))
+    let (_, output_field) = Expr::BinaryExpr(expr.clone()).to_field(schema)?;
+    let output_type = to_substrait_type(
+        producer,
+        output_field.data_type(),
+        output_field.is_nullable(),
+    )?;
+    Ok(make_binary_op_scalar_func(
+        producer,
+        &l,
+        &r,
+        *op,
+        &output_type,
+    ))
 }
 
 pub fn from_like(
@@ -215,6 +231,7 @@ pub fn make_binary_op_scalar_func(
     lhs: &Expression,
     rhs: &Expression,
     op: Operator,
+    output_type: &Type,
 ) -> Expression {
     let function_anchor = producer.register_function(operator_to_name(op).to_string());
     #[expect(deprecated)]
@@ -229,7 +246,7 @@ pub fn make_binary_op_scalar_func(
                     arg_type: Some(ArgType::Value(rhs.clone())),
                 },
             ],
-            output_type: None,
+            output_type: Some(output_type.clone()),
             args: vec![],
             options: vec![],
         })),
@@ -247,57 +264,21 @@ pub fn from_between(
         low,
         high,
     } = between;
-    if *negated {
+
+    let expr = if *negated {
         // `expr NOT BETWEEN low AND high` can be translated into (expr < low OR high < expr)
-        let substrait_expr = producer.handle_expr(expr.as_ref(), schema)?;
-        let substrait_low = producer.handle_expr(low.as_ref(), schema)?;
-        let substrait_high = producer.handle_expr(high.as_ref(), schema)?;
-
-        let l_expr = make_binary_op_scalar_func(
-            producer,
-            &substrait_expr,
-            &substrait_low,
-            Operator::Lt,
-        );
-        let r_expr = make_binary_op_scalar_func(
-            producer,
-            &substrait_high,
-            &substrait_expr,
-            Operator::Lt,
-        );
-
-        Ok(make_binary_op_scalar_func(
-            producer,
-            &l_expr,
-            &r_expr,
-            Operator::Or,
-        ))
+        Expr::or(
+            Expr::lt(*expr.clone(), *low.clone()),
+            Expr::lt(*high.clone(), *expr.clone()),
+        )
     } else {
         // `expr BETWEEN low AND high` can be translated into (low <= expr AND expr <= high)
-        let substrait_expr = producer.handle_expr(expr.as_ref(), schema)?;
-        let substrait_low = producer.handle_expr(low.as_ref(), schema)?;
-        let substrait_high = producer.handle_expr(high.as_ref(), schema)?;
-
-        let l_expr = make_binary_op_scalar_func(
-            producer,
-            &substrait_low,
-            &substrait_expr,
-            Operator::LtEq,
-        );
-        let r_expr = make_binary_op_scalar_func(
-            producer,
-            &substrait_expr,
-            &substrait_high,
-            Operator::LtEq,
-        );
-
-        Ok(make_binary_op_scalar_func(
-            producer,
-            &l_expr,
-            &r_expr,
-            Operator::And,
-        ))
-    }
+        Expr::and(
+            Expr::lt_eq(*low.clone(), *expr.clone()),
+            Expr::lt_eq(*expr.clone(), *high.clone()),
+        )
+    };
+    producer.handle_expr(&expr, schema)
 }
 
 pub fn operator_to_name(op: Operator) -> &'static str {
@@ -344,5 +325,39 @@ pub fn operator_to_name(op: Operator) -> &'static str {
         Operator::BitwiseXor => "bitwise_xor",
         Operator::BitwiseShiftRight => "bitwise_shift_right",
         Operator::BitwiseShiftLeft => "bitwise_shift_left",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::logical_plan::producer::{
+        DefaultSubstraitProducer, SubstraitProducer, to_substrait_type,
+    };
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::common::{DFSchema, DFSchemaRef};
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::lit;
+    use substrait::proto::Expression;
+    use substrait::proto::expression::{RexType, ScalarFunction};
+
+    #[tokio::test]
+    async fn binary_expr_output_type() -> datafusion::common::Result<()> {
+        let state = SessionStateBuilder::default().build();
+        let empty_schema = DFSchemaRef::new(DFSchema::empty());
+        let mut producer = DefaultSubstraitProducer::new(&state);
+
+        let expr = lit(1i64) + lit(2i64);
+        let substrait_expr = producer.handle_expr(&expr, &empty_schema)?;
+        if let Expression {
+            rex_type: Some(RexType::ScalarFunction(ScalarFunction { output_type, .. })),
+        } = substrait_expr
+        {
+            let expected_type =
+                to_substrait_type(&mut producer, &DataType::Int64, false)?;
+            assert_eq!(output_type, Some(expected_type));
+            Ok(())
+        } else {
+            panic!("Substrait ScalarFunction expected")
+        }
     }
 }
