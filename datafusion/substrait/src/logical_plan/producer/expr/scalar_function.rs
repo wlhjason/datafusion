@@ -40,13 +40,20 @@ pub fn from_scalar_function(
 
     let arguments = custom_argument_handler(fun.name(), arguments);
 
+    let (_, output_field) = Expr::ScalarFunction(fun.clone()).to_field(schema)?;
+    let output_type = to_substrait_type(
+        producer,
+        output_field.data_type(),
+        output_field.is_nullable(),
+    )?;
+
     let function_anchor = producer.register_function(fun.name().to_string());
     #[expect(deprecated)]
     Ok(Expression {
         rex_type: Some(RexType::ScalarFunction(ScalarFunction {
             function_reference: function_anchor,
             arguments,
-            output_type: None,
+            output_type: Some(output_type),
             options: vec![],
             args: vec![],
         })),
